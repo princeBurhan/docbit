@@ -33,7 +33,7 @@ export function createDefaultConfig(schema: DatasetSchema): ReportConfig {
       orientation: 'portrait',
       density: 'comfortable',
       pdfTemplateId: DEFAULT_PDF_TEMPLATE_ID,
-      branding: { enabled: false, logoDataUrl: null, accentColor: '#0E8A82', footerText: '' }
+      branding: { enabled: false, logoDataUrl: null, accentColor: '#0E8A82', footerText: '', contactInfo: '', showPageNumbers: true }
     }
   };
 }

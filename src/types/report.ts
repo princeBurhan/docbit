@@ -73,6 +73,8 @@ export interface BrandingConfig {
   logoDataUrl: string | null;
   accentColor: string; // hex, e.g. "#0E8A82" — drives PDF header/accent color when enabled
   footerText: string;
+  contactInfo: string; // optional website / phone line shown in footer
+  showPageNumbers: boolean;
 }
 
 export interface DesignConfig {

@@ -2,9 +2,9 @@ import React, { useState } from 'react';
 import type { ProcessedReport } from '../../types/processed';
 import type { ReportConfig } from '../../types/report';
 import type { DatasetSchema, RawDataset } from '../../types/dataset';
-import { exportCsv, exportExcel, exportJson, exportPdf, validateBeforeExport, checkPdfEligibility, type ExportFormat } from '../../export';
+import { exportCsv, exportExcel, exportJson, exportPdf, validateBeforeExport, assessPdfComplexity, type ExportFormat } from '../../export';
 import { useToast } from '../../hooks/useToast';
-import { DesignPanel } from './DesignPanel';
+import { DesignPanel, PdfDesignPanel } from './DesignPanel';
 
 interface Props {
   raw: RawDataset;
@@ -26,9 +26,11 @@ export function ExportPanel({ raw, schema, report, config, update }: Props) {
   const [busy, setBusy] = useState<ExportFormat | null>(null);
   const [prepStep, setPrepStep] = useState(-1);
   const [justCompleted, setJustCompleted] = useState<ExportFormat | null>(null);
+  const [showPdfDesign, setShowPdfDesign] = useState(false);
   const toast = useToast();
   const validation = validateBeforeExport(report, config.design);
-  const pdfEligibility = checkPdfEligibility(report);
+  const complexity = assessPdfComplexity(report, config.design);
+  const pdfBlocked = complexity.level === 'too-large';
 
   const relevantSteps = PREP_STEPS.filter((s) => {
     if (s === 'Filters applied' && report.stats.activeFilterCount === 0) return false;
@@ -42,16 +44,14 @@ export function ExportPanel({ raw, schema, report, config, update }: Props) {
       toast.push(validation.problems[0], 'error');
       return;
     }
-    if (format === 'pdf' && !pdfEligibility.eligible) {
-      toast.push(pdfEligibility.reason ?? "This report isn't a fit for PDF export.", 'error');
+    if (format === 'pdf' && pdfBlocked) {
+      toast.push(complexity.recommendation ?? "This report isn't a fit for PDF export.", 'error');
       return;
     }
     setBusy(format);
     setJustCompleted(null);
     setPrepStep(0);
 
-    // Reveal each real, already-computed validation step in quick succession —
-    // no artificial multi-second delay, just enough for the eye to track it.
     for (let i = 0; i < relevantSteps.length; i++) {
       // eslint-disable-next-line no-await-in-loop
       await new Promise((r) => setTimeout(r, 70));
@@ -132,11 +132,28 @@ export function ExportPanel({ raw, schema, report, config, update }: Props) {
       )}
 
       <section>
-        <p className="text-xs font-semibold uppercase tracking-wide text-ink-600/60 mb-2">Professional report</p>
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-ink-600/60">Professional report</p>
+          <button
+            onClick={() => setShowPdfDesign((v) => !v)}
+            className="focus-ring text-xs font-medium text-signal-600 hover:text-signal-700"
+          >
+            {showPdfDesign ? 'Hide PDF design' : 'Customize PDF design'}
+          </button>
+        </div>
+
+        {showPdfDesign && (
+          <div className="mb-3 animate-fade-in">
+            <PdfDesignPanel config={config} update={update} />
+          </div>
+        )}
+
+        <ComplexityBanner complexity={complexity} />
+
         <button
           onClick={() => runExport('pdf')}
-          disabled={!validation.ok || !pdfEligibility.eligible || busy !== null}
-          title={pdfEligibility.eligible ? undefined : pdfEligibility.reason ?? undefined}
+          disabled={!validation.ok || pdfBlocked || busy !== null}
+          title={pdfBlocked ? complexity.recommendation ?? undefined : undefined}
           className="focus-ring w-full flex items-center gap-3 rounded-xl border-2 border-ink-900 bg-ink-900 text-white px-4 py-3.5 text-left hover:bg-ink-800 disabled:opacity-50 disabled:hover:bg-ink-900 transition-colors active:scale-[0.99] disabled:active:scale-100"
         >
           <span className="h-9 w-9 rounded-lg bg-white/10 flex items-center justify-center shrink-0">
@@ -148,21 +165,18 @@ export function ExportPanel({ raw, schema, report, config, update }: Props) {
           </span>
           <span className="flex-1 min-w-0">
             <span className="block text-sm font-semibold">Export as PDF</span>
-            <span className="block text-xs text-white/60">Printable, presentation-ready report</span>
+            <span className="block text-xs text-white/60">
+              {config.design.orientation === 'landscape' ? 'Landscape' : 'Portrait'} \u00b7 ~{complexity.estimatedPages} page{complexity.estimatedPages === 1 ? '' : 's'}
+            </span>
           </span>
           {busy === 'pdf' ? (
             <div className="h-4 w-4 rounded-full border-2 border-white/30 border-t-white animate-spin shrink-0" />
           ) : justCompleted === 'pdf' ? (
             <CheckBadge />
           ) : (
-            <span className="text-white/50 shrink-0">↓</span>
+            <span className="text-white/50 shrink-0">\u2193</span>
           )}
         </button>
-        {!pdfEligibility.eligible && (
-          <p className="text-xs text-amber-500 bg-amber-100 rounded-lg px-3 py-2 mt-2 leading-relaxed">
-            {pdfEligibility.reason}
-          </p>
-        )}
       </section>
 
       <section>
@@ -187,12 +201,53 @@ export function ExportPanel({ raw, schema, report, config, update }: Props) {
               ) : justCompleted === f.id ? (
                 <CheckBadge dark />
               ) : (
-                <span className="text-ink-600/40 shrink-0">↓</span>
+                <span className="text-ink-600/40 shrink-0">\u2193</span>
               )}
             </button>
           ))}
         </div>
       </section>
+    </div>
+  );
+}
+
+function ComplexityBanner({ complexity }: { complexity: ReturnType<typeof assessPdfComplexity> }) {
+  if (complexity.level === 'safe') return null;
+
+  const isBlocked = complexity.level === 'too-large';
+  const isWarning = complexity.level === 'large';
+
+  return (
+    <div className={[
+      'rounded-lg px-3.5 py-3 mb-2.5',
+      isBlocked ? 'border border-rose-500/25 bg-rose-100' : 'border border-amber-500/25 bg-amber-100'
+    ].join(' ')}>
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className={[
+          'text-xs font-semibold uppercase tracking-wide',
+          isBlocked ? 'text-rose-500' : 'text-amber-500'
+        ].join(' ')}>
+          {isBlocked ? 'PDF not recommended' : 'Large PDF'}
+        </span>
+        <span className="text-[11px] text-ink-600/50">
+          {complexity.rows.toLocaleString()} rows \u00d7 {complexity.columns} cols \u00b7 ~{complexity.estimatedPages} pages
+        </span>
+      </div>
+      {complexity.recommendation && (
+        <p className="text-xs text-ink-700 leading-relaxed mb-2">{complexity.recommendation}</p>
+      )}
+      {complexity.alternatives.length > 0 && (
+        <ul className="text-xs text-ink-600/70 space-y-1 list-disc list-inside">
+          {complexity.alternatives.map((a: string) => (
+            <li key={a}>{a}</li>
+          ))}
+        </ul>
+      )}
+      {isBlocked && (
+        <p className="text-[11px] text-rose-500/70 mt-2">
+          Use Excel or CSV below for the complete dataset.
+        </p>
+      )}
     </div>
   );
 }

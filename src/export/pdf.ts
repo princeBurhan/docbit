@@ -4,7 +4,7 @@ import type { ProcessedReport } from '../types/processed';
 import type { DesignConfig } from '../types/report';
 import { displayCell } from '../utils/format';
 import { safeFileName } from './download';
-import { getPdfTemplate, type PdfTemplateStyle } from './pdfTemplates';
+import { getComposition, type PdfComposition, type PdfOrientation } from './pdfTemplates';
 
 function hexToRgb(hex: string): [number, number, number] {
   const clean = hex.replace('#', '');
@@ -12,6 +12,11 @@ function hexToRgb(hex: string): [number, number, number] {
   const num = parseInt(full, 16);
   if (isNaN(num) || full.length !== 6) return [14, 138, 130];
   return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+
+function bestTextColor(bg: [number, number, number]): [number, number, number] {
+  const luminance = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) / 255;
+  return luminance > 0.6 ? [15, 23, 42] : [255, 255, 255];
 }
 
 function imageFormatFromDataUrl(dataUrl: string): 'PNG' | 'JPEG' | 'WEBP' | null {
@@ -22,169 +27,162 @@ function imageFormatFromDataUrl(dataUrl: string): 'PNG' | 'JPEG' | 'WEBP' | null
 }
 
 export function exportPdf(report: ProcessedReport, design: DesignConfig): void {
-  const template = getPdfTemplate(design.pdfTemplateId);
-  const style: PdfTemplateStyle = template.style;
+  const orientation: PdfOrientation = design.orientation === 'landscape' ? 'landscape' : 'portrait';
+  const base = getComposition(design.pdfTemplateId, orientation);
   const branding = design.branding;
-  const accent = branding.enabled ? hexToRgb(branding.accentColor) : style.accent;
-  const headerFill = branding.enabled ? accent : style.headerFill;
-  const headerText = branding.enabled ? bestTextColor(accent) : style.headerText;
 
-  const doc = new jsPDF({
-    orientation: design.orientation === 'landscape' ? 'landscape' : 'portrait',
-    unit: 'pt',
-    format: 'a4'
-  });
+  const accent = branding.enabled ? hexToRgb(branding.accentColor) : base.accentRule.color;
+  const composition: PdfComposition = branding.enabled
+    ? {
+        ...base,
+        accentRule: { ...base.accentRule, color: accent },
+        table: { ...base.table, headFill: accent, headText: bestTextColor(accent) }
+      }
+    : base;
 
-  const marginLeft = 36;
+  const doc = new jsPDF({ orientation, unit: 'pt', format: 'a4' });
   const pageWidth = doc.internal.pageSize.getWidth();
-  const centered = template.style.titleFont === 'times'; // Ledger/Executive read as more formal, centered layouts
-  let cursorY = 42;
-  let titleX = marginLeft;
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const m = composition.margin;
+  const contentWidth = pageWidth - m.left - m.right;
 
-  // Logo (top-right), when custom branding is enabled and a logo was provided.
-  const logoFormat = branding.enabled && branding.logoDataUrl ? imageFormatFromDataUrl(branding.logoDataUrl) : null;
-  if (logoFormat && branding.logoDataUrl) {
-    try {
-      const logoSize = 36;
-      doc.addImage(branding.logoDataUrl, logoFormat, pageWidth - marginLeft - logoSize, 30, logoSize, logoSize, undefined, 'FAST');
-    } catch {
-      // Corrupt or unsupported image data — skip the logo rather than fail the whole export.
-    }
-  }
-
-  if (centered) {
-    titleX = pageWidth / 2;
-  }
-
-  const textOpts = centered ? { align: 'center' as const } : undefined;
-
-  if (design.title) {
-    doc.setFont(style.titleFont, 'bold');
-    doc.setFontSize(18);
-    doc.setTextColor(15, 23, 42);
-    doc.text(design.title, titleX, cursorY, textOpts);
-    cursorY += 22;
-  }
-  if (design.subtitle) {
-    doc.setFont(style.titleFont, 'normal');
-    doc.setFontSize(11);
-    doc.setTextColor(71, 85, 105);
-    doc.text(design.subtitle, titleX, cursorY, textOpts);
-    cursorY += 16;
-  }
-  if (design.organization) {
-    doc.setFont(style.titleFont, 'normal');
-    doc.setFontSize(10);
-    doc.setTextColor(100, 116, 139);
-    doc.text(design.organization, titleX, cursorY, textOpts);
-    cursorY += 14;
-  }
-  if (design.showGeneratedDate) {
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(148, 163, 184);
-    doc.text(`Generated ${new Date().toLocaleDateString()} · ${report.stats.finalRowCount} records`, titleX, cursorY, textOpts);
-    cursorY += 14;
-  }
-
-  // Thin accent rule under the header block — the one element every template shows.
-  doc.setDrawColor(accent[0], accent[1], accent[2]);
-  doc.setLineWidth(1.4);
-  doc.line(marginLeft, cursorY + 4, pageWidth - marginLeft, cursorY + 4);
-  cursorY += 16;
+  let cursorY = drawHeader(doc, composition, design, report, branding, pageWidth, m);
+  cursorY += composition.spacing.headerToTable;
 
   const head = [report.columns.map((c) => c.displayName)];
   const bodyFor = (rows: ProcessedReport['rows']) =>
     rows.map((row) => row.values.map((v, i) => displayCell(v, report.columns[i].dataType, design, report.columns[i].isCurrency)));
 
-  const density = design.density === 'compact' ? 4 : 7;
-  const tableTheme = style.tableStyle === 'plain' ? 'plain' : style.tableStyle === 'grid' ? 'grid' : 'striped';
-  const headStyles = { fillColor: headerFill, textColor: headerText, lineColor: accent, lineWidth: style.tableStyle === 'grid' ? 0.6 : 0 };
-  const bodyStyles = { textColor: style.bodyText };
-  const alternateRowStyles = { fillColor: style.alternateRowFill };
-  const gridLine = style.tableStyle === 'grid' ? { lineColor: [220, 222, 216] as [number, number, number], lineWidth: 0.5 } : {};
+  const t = composition.table;
+  const headStyles = { fillColor: t.headFill, textColor: t.headText, lineColor: composition.accentRule.color, lineWidth: t.style === 'grid' ? 0.6 : 0 };
+  const bodyStyles = { textColor: t.bodyText };
+  const alternateRowStyles = { fillColor: t.alternateRowFill };
+  const gridLine = t.style === 'grid' ? { lineColor: t.gridLineColor, lineWidth: 0.5 } : {};
+  const didDrawPage = (data: { pageNumber: number }) => drawFooter(doc, composition, design, branding, data.pageNumber, pageWidth, pageHeight, m);
 
   if (report.groups) {
     let startY = cursorY;
     for (const group of report.groups) {
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(10);
+      doc.setFontSize(t.fontSize + 1);
       doc.setTextColor(15, 23, 42);
-      doc.text(`${group.label} (${group.rows.length})`, marginLeft, startY);
-      startY += 12;
+      doc.text(`${group.label} (${group.rows.length})`, m.left, startY);
+      startY += t.fontSize + 4;
 
       autoTable(doc, {
-        head,
-        body: bodyFor(group.rows),
-        startY,
-        margin: { left: marginLeft, right: marginLeft },
-        styles: { fontSize: 8, cellPadding: density, overflow: 'linebreak', ...gridLine },
-        headStyles,
-        bodyStyles,
-        alternateRowStyles,
-        theme: tableTheme,
-        didDrawPage: (data) => addFooter(doc, data.pageNumber, design)
+        head, body: bodyFor(group.rows), startY,
+        margin: { left: m.left, right: m.right },
+        styles: { fontSize: t.fontSize, cellPadding: t.cellPadding, overflow: 'linebreak', ...gridLine },
+        headStyles, bodyStyles, alternateRowStyles, theme: t.style, didDrawPage
       });
-
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      startY = (doc as any).lastAutoTable.finalY + 16;
+      startY = (doc as any).lastAutoTable.finalY + 14;
 
       if (group.summaries.length) {
         doc.setFont('helvetica', 'normal');
-        doc.setFontSize(8);
-        doc.setTextColor(71, 85, 105);
-        const summaryLine = group.summaries.map((s) => `${s.label}: ${s.displayValue}`).join('   ·   ');
-        doc.text(summaryLine, marginLeft, startY);
-        startY += 18;
+        doc.setFontSize(t.fontSize);
+        doc.setTextColor(...t.bodyText);
+        const line = group.summaries.map((s) => `${s.label}: ${s.displayValue}`).join('   \u00b7   ');
+        doc.text(line, m.left, startY);
+        startY += 14;
       }
     }
   } else {
     autoTable(doc, {
-      head,
-      body: bodyFor(report.rows),
-      startY: cursorY,
-      margin: { left: marginLeft, right: marginLeft, bottom: 50 },
-      styles: { fontSize: 8, cellPadding: density, overflow: 'linebreak', ...gridLine },
-      headStyles,
-      bodyStyles,
-      alternateRowStyles,
-      theme: tableTheme,
-      showHead: 'everyPage',
-      didDrawPage: (data) => addFooter(doc, data.pageNumber, design)
+      head, body: bodyFor(report.rows), startY: cursorY,
+      margin: { left: m.left, right: m.right, bottom: m.bottom + 24 },
+      styles: { fontSize: t.fontSize, cellPadding: t.cellPadding, overflow: 'linebreak', ...gridLine },
+      headStyles, bodyStyles, alternateRowStyles, theme: t.style, showHead: 'everyPage', didDrawPage
     });
   }
 
-  if (design.showSummary && report.summaries.length > 0) {
+  if (design.showSummary && report.summaries.length > 0 && composition.summary.placement !== 'header-band') {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const finalY = ((doc as any).lastAutoTable?.finalY ?? cursorY) + 20;
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(10);
-    doc.setTextColor(15, 23, 42);
-    doc.text('Summary', marginLeft, finalY);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(51, 65, 85);
-    report.summaries.forEach((s, i) => {
-      doc.text(`${s.label}: ${s.displayValue}`, marginLeft, finalY + 16 + i * 14);
-    });
+    const finalY = ((doc as any).lastAutoTable?.finalY ?? cursorY) + composition.spacing.tableToSummary;
+    drawSummaryBlock(doc, composition, report.summaries, finalY, m.left, contentWidth);
   }
 
   doc.save(safeFileName(design.title, 'pdf'));
 }
 
-function bestTextColor(bg: [number, number, number]): [number, number, number] {
-  const luminance = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) / 255;
-  return luminance > 0.6 ? [15, 23, 42] : [255, 255, 255];
+function drawHeader(
+  doc: jsPDF, c: PdfComposition, design: DesignConfig, report: ProcessedReport,
+  branding: DesignConfig['branding'], pageWidth: number, m: PdfComposition['margin']
+): number {
+  const align = c.title.align;
+  const titleX = align === 'center' ? pageWidth / 2 : align === 'right' ? pageWidth - m.right : m.left;
+  const textOpts = align === 'left' ? undefined : { align: align as 'center' | 'right' };
+  let y = m.top;
+
+  const logoFormat = branding.enabled && branding.logoDataUrl ? imageFormatFromDataUrl(branding.logoDataUrl) : null;
+  if (logoFormat && branding.logoDataUrl && c.logo.placement !== 'none') {
+    const sz = c.logo.size;
+    try {
+      if (c.logo.placement === 'top-right') doc.addImage(branding.logoDataUrl, logoFormat, pageWidth - m.right - sz, m.top - 4, sz, sz, undefined, 'FAST');
+      else if (c.logo.placement === 'top-left') doc.addImage(branding.logoDataUrl, logoFormat, m.left, m.top - 4, sz, sz, undefined, 'FAST');
+      else if (c.logo.placement === 'inline-left') doc.addImage(branding.logoDataUrl, logoFormat, m.left, y, sz, sz, undefined, 'FAST');
+    } catch { /* skip corrupt logo */ }
+  }
+
+  const inlineOffset = c.logo.placement === 'inline-left' && logoFormat ? c.logo.size + 10 : 0;
+  const titleXShifted = align === 'left' ? titleX + inlineOffset : titleX;
+
+  if (design.title) {
+    doc.setFont(c.title.font, 'bold'); doc.setFontSize(c.title.size); doc.setTextColor(...c.title.color);
+    doc.text(design.title, titleXShifted, y, textOpts); y += c.title.size + 4;
+  }
+  if (design.subtitle) {
+    doc.setFont(c.subtitle.font, 'normal'); doc.setFontSize(c.subtitle.size); doc.setTextColor(...c.subtitle.color);
+    doc.text(design.subtitle, titleXShifted, y, textOpts); y += c.subtitle.size + 3;
+  }
+  if (design.organization) {
+    doc.setFont(c.organization.font, 'normal'); doc.setFontSize(c.organization.size); doc.setTextColor(...c.organization.color);
+    doc.text(design.organization, titleXShifted, y, textOpts); y += c.organization.size + 3;
+  }
+  if (design.showGeneratedDate) {
+    doc.setFont(c.meta.font, 'normal'); doc.setFontSize(c.meta.size); doc.setTextColor(...c.meta.color);
+    doc.text(`Generated ${new Date().toLocaleDateString()} \u00b7 ${report.stats.finalRowCount} records`, titleXShifted, y, textOpts); y += c.meta.size + 3;
+  }
+
+  if (design.showSummary && report.summaries.length > 0 && c.summary.placement === 'header-band') {
+    y += 4;
+    doc.setFont(c.summary.font, 'normal'); doc.setFontSize(c.summary.size);
+    report.summaries.forEach((s) => {
+      doc.setTextColor(...c.summary.labelColor); doc.text(`${s.label}:`, m.left, y);
+      doc.setTextColor(...c.summary.valueColor); doc.text(s.displayValue, m.left + 110, y);
+      y += c.summary.size + 4;
+    });
+    y -= 2;
+  }
+
+  doc.setDrawColor(...c.accentRule.color); doc.setLineWidth(c.accentRule.width);
+  doc.line(m.left, y + 4, pageWidth - m.right, y + 4);
+  y += 8;
+  return y;
 }
 
-function addFooter(doc: jsPDF, pageNumber: number, design: DesignConfig): void {
-  const pageSize = doc.internal.pageSize;
-  const pageWidth = pageSize.getWidth();
-  const pageHeight = pageSize.getHeight();
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8);
-  doc.setTextColor(148, 163, 184);
-  const footerLeft = design.branding.enabled && design.branding.footerText ? design.branding.footerText : 'Generated with DocBit';
-  doc.text(footerLeft, 36, pageHeight - 20);
-  doc.text(`Page ${pageNumber}`, pageWidth - 60, pageHeight - 20);
+function drawSummaryBlock(
+  doc: jsPDF, c: PdfComposition, summaries: ProcessedReport['summaries'],
+  y: number, x: number, _w: number
+): void {
+  doc.setFont(c.summary.font, 'bold'); doc.setFontSize(c.summary.size + 1); doc.setTextColor(15, 23, 42);
+  doc.text('Summary', x, y);
+  doc.setFont(c.summary.font, 'normal'); doc.setFontSize(c.summary.size);
+  summaries.forEach((s, i) => {
+    doc.setTextColor(...c.summary.labelColor); doc.text(`${s.label}:`, x, y + 14 + i * (c.summary.size + 5));
+    doc.setTextColor(...c.summary.valueColor); doc.text(s.displayValue, x + 110, y + 14 + i * (c.summary.size + 5));
+  });
+}
+
+function drawFooter(
+  doc: jsPDF, c: PdfComposition, design: DesignConfig, branding: DesignConfig['branding'],
+  pageNumber: number, pageWidth: number, pageHeight: number, m: PdfComposition['margin']
+): void {
+  doc.setFont(c.footer.font, 'normal'); doc.setFontSize(c.footer.size); doc.setTextColor(...c.footer.color);
+  const footerLeft = branding.enabled && branding.footerText ? branding.footerText : 'Generated with DocBit';
+  const contact = branding.enabled && branding.contactInfo ? branding.contactInfo : '';
+  doc.text(contact ? `${footerLeft} \u00b7 ${contact}` : footerLeft, m.left, pageHeight - m.bottom + 16);
+  if (c.footer.pageNumbers && branding.showPageNumbers) {
+    doc.text(`Page ${pageNumber}`, pageWidth - m.right - 40, pageHeight - m.bottom + 16);
+  }
 }
